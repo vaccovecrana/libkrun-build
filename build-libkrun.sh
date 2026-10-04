@@ -6,6 +6,12 @@
 # archives (tarballs, NOT git clones) and build them, staging the results
 # into ./out. Nothing is installed system-wide unless --install is given.
 #
+# Local patches under ./patches/*.patch are applied to the fetched libkrun
+# tree (before compiling) via `patch -p1`. They must be `-p1` diffs rooted at
+# the libkrun source tree root. A patch that is already present is skipped,
+# so re-runs with --no-fetch are idempotent; any rejected hunk aborts the
+# build (die), never a silent unpatched build.
+#
 # NOTE: this script intentionally targets the libkrun 2.0 API (the
 # builder-style krun_vmm_builder_* interface). The `ffi` feature is ALWAYS
 # enabled so the C API symbols are exported for FFI/JNI/Panama consumers
@@ -30,6 +36,7 @@
 #   --install       Also `sudo make install` into /usr/local.
 #   --clean         Remove src/, out/ and .tmp/ before starting.
 #   --no-fetch      Reuse existing src/ trees (skip re-download of archives).
+#   --no-patch      Do not apply patches/*.patch to the libkrun tree.
 #   -h, --help      Show this help.
 #
 # Output:
@@ -46,6 +53,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$ROOT/src"
 OUT="$ROOT/out"
 TMP="$ROOT/.tmp"
+PATCHES="$ROOT/patches"
 
 LIBKRUN_REPO="libkrun/libkrun"
 LIBKRUNFW_REPO="containers/libkrunfw"
@@ -59,6 +67,7 @@ DO_VERIFY=1
 DO_INSTALL=0
 DO_CLEAN=0
 DO_FETCH=1
+DO_PATCH=1
 
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_INFO=$'\033[1;34m'; C_WARN=$'\033[1;33m'
@@ -85,6 +94,7 @@ while [ $# -gt 0 ]; do
         --install)  DO_INSTALL=1; shift ;;
         --clean)    DO_CLEAN=1; shift ;;
         --no-fetch) DO_FETCH=0; shift ;;
+        --no-patch) DO_PATCH=0; shift ;;
         -h|--help)  usage; exit 0 ;;
         *)          die "unknown option: $1 (try --help)" ;;
     esac
@@ -206,6 +216,39 @@ fetch_all() {
     if [ "$DO_FW" -eq 1 ]; then
         fetch_snapshot "$LIBKRUNFW_REPO" "$SRC/libkrunfw"
     fi
+}
+
+# ---------------------------------------------------------------- patches
+# Apply local patches/*.patch (in lexical order) to the fetched libkrun tree.
+# The patch is first tested in reverse: a clean reverse-apply means it is
+# already present (e.g. --no-fetch reusing a patched tree), so it is skipped.
+# Any other outcome is applied with --forward; a rejected hunk is fatal.
+apply_patches() {
+    [ "$DO_PATCH" -eq 1 ] || { log "Skipping patches (--no-patch)"; return; }
+
+    local dir="$SRC/libkrun"
+    [ -d "$dir" ] || die "patch target missing: $dir"
+
+    shopt -s nullglob
+    local patches=("$PATCHES"/*.patch)
+    shopt -u nullglob
+    if [ "${#patches[@]}" -eq 0 ]; then
+        log "No patches to apply ($PATCHES/*.patch)"
+        return
+    fi
+
+    local p
+    for p in "${patches[@]}"; do
+        if patch -p1 --dry-run -R -d "$dir" < "$p" >/dev/null 2>&1; then
+            ok "already applied, skipping: $(basename "$p")"
+            continue
+        fi
+        log "Applying patch: $(basename "$p")"
+        if ! patch -p1 --forward --reject-file=- -d "$dir" < "$p"; then
+            die "patch failed (rejected hunks): $(basename "$p")"
+        fi
+        ok "applied: $(basename "$p")"
+    done
 }
 
 # ---------------------------------------------------------------- libclang
@@ -342,6 +385,7 @@ main() {
         [ "$DO_FW" -eq 0 ] || [ -d "$SRC/libkrunfw" ] || die "--no-fetch: $SRC/libkrunfw does not exist"
         log "Reusing existing sources (--no-fetch)"
     fi
+    apply_patches
     if [ "$DO_FW" -eq 1 ]; then build_libkrunfw; fi
     build_libkrun
     if [ "$DO_VERIFY" -eq 1 ]; then verify; fi
